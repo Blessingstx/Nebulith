@@ -1,6 +1,6 @@
 ;; Nebulith - Decentralized Voting in the Cosmic DAO
 ;; A permissionless DAO framework enabling decentralized governance via token-weighted voting
-;; with multi-signature proposal execution for enhanced security
+;; with multi-signature proposal execution and integrated treasury management
 
 ;; Constants
 (define-constant CONTRACT_OWNER tx-sender)
@@ -20,6 +20,11 @@
 (define-constant ERR_GUARDIAN_EXISTS (err u113))
 (define-constant ERR_GUARDIAN_NOT_FOUND (err u114))
 (define-constant ERR_MIN_GUARDIANS_REQUIRED (err u115))
+(define-constant ERR_INVALID_TREASURY_CONTRACT (err u116))
+(define-constant ERR_TREASURY_EXECUTION_FAILED (err u117))
+(define-constant ERR_INVALID_AMOUNT (err u118))
+(define-constant ERR_INVALID_RECIPIENT (err u119))
+(define-constant ERR_TREASURY_NOT_SET (err u120))
 
 ;; Data Variables
 (define-data-var next-proposal-id uint u1)
@@ -30,6 +35,7 @@
 (define-data-var high-value-threshold uint u10000000) ;; 10M tokens - requires multisig
 (define-data-var required-signatures uint u2) ;; Minimum signatures required
 (define-data-var guardian-count uint u0) ;; Current number of guardians
+(define-data-var treasury-contract (optional principal) none) ;; Treasury contract address
 
 ;; Proposal States
 (define-constant PROPOSAL_PENDING u0)
@@ -39,6 +45,33 @@
 (define-constant PROPOSAL_EXECUTED u4)
 (define-constant PROPOSAL_VETOED u5)
 (define-constant PROPOSAL_AWAITING_SIGNATURES u6)
+
+;; Proposal Types
+(define-constant PROPOSAL_TYPE_GENERAL u0)
+(define-constant PROPOSAL_TYPE_TREASURY u1)
+(define-constant PROPOSAL_TYPE_PARAMETER u2)
+
+;; Treasury contract trait for fund transfers
+(define-trait treasury-trait
+    (
+        (transfer-funds (uint principal (optional (buff 34))) (response bool uint))
+        (get-balance () (response uint uint))
+        (is-authorized-dao (principal) (response bool uint))
+    )
+)
+
+;; Governance token trait (SIP-010 compatible)
+(define-trait governance-token-trait
+    (
+        (transfer (uint principal principal (optional (buff 34))) (response bool uint))
+        (get-name () (response (string-ascii 32) uint))
+        (get-symbol () (response (string-ascii 10) uint))
+        (get-decimals () (response uint uint))
+        (get-balance (principal) (response uint uint))
+        (get-total-supply () (response uint uint))
+        (get-token-uri () (response (optional (string-utf8 256)) uint))
+    )
+)
 
 ;; Data Maps
 (define-map proposals
@@ -54,7 +87,10 @@
         abstain-votes: uint,
         state: uint,
         executed: bool,
-        requires-multisig: bool
+        requires-multisig: bool,
+        proposal-type: uint,
+        treasury-amount: (optional uint),
+        treasury-recipient: (optional principal)
     }
 )
 
@@ -89,17 +125,10 @@
     { count: uint }
 )
 
-;; Governance token trait (SIP-010 compatible)
-(define-trait governance-token-trait
-    (
-        (transfer (uint principal principal (optional (buff 34))) (response bool uint))
-        (get-name () (response (string-ascii 32) uint))
-        (get-symbol () (response (string-ascii 10) uint))
-        (get-decimals () (response uint uint))
-        (get-balance (principal) (response uint uint))
-        (get-total-supply () (response uint uint))
-        (get-token-uri () (response (optional (string-utf8 256)) uint))
-    )
+;; Treasury execution tracking
+(define-map treasury-executions
+    { proposal-id: uint }
+    { executed: bool, execution-block: uint, amount: uint, recipient: principal }
 )
 
 ;; Read-only functions
@@ -184,6 +213,21 @@
     (>= for-votes (var-get high-value-threshold))
 )
 
+(define-read-only (get-treasury-contract)
+    (var-get treasury-contract)
+)
+
+(define-read-only (is-treasury-proposal (proposal-id uint))
+    (match (get-proposal proposal-id)
+        proposal (is-eq (get proposal-type proposal) PROPOSAL_TYPE_TREASURY)
+        false
+    )
+)
+
+(define-read-only (get-treasury-execution (proposal-id uint))
+    (map-get? treasury-executions { proposal-id: proposal-id })
+)
+
 ;; Private functions
 (define-private (get-effective-voting-power (voter principal))
     (let ((voter-data (get-voter-power voter)))
@@ -221,6 +265,28 @@
         (+ current-count u1))
 )
 
+(define-private (validate-proposal-inputs (title (string-ascii 100)) (description (string-ascii 500)))
+    (and (> (len title) u0) 
+         (<= (len title) u100)
+         (> (len description) u0)
+         (<= (len description) u500))
+)
+
+(define-private (validate-treasury-params (amount uint) (recipient principal))
+    (and (> amount u0)
+         (<= amount u1000000000000) ;; Max reasonable amount
+         (not (is-eq recipient (as-contract tx-sender))) ;; Cannot send to self
+         (not (is-eq recipient CONTRACT_OWNER))) ;; Cannot send to owner
+)
+
+;; Fixed treasury transfer function - no dynamic contract calls
+(define-private (prepare-treasury-execution (proposal-id uint) (amount uint) (recipient principal))
+    (begin
+        (map-set treasury-executions { proposal-id: proposal-id }
+            { executed: false, execution-block: stacks-block-height, amount: amount, recipient: recipient })
+        (ok true))
+)
+
 ;; Public functions
 (define-public (create-proposal 
     (title (string-ascii 100))
@@ -235,8 +301,7 @@
         (asserts! (>= proposer-power (var-get proposal-threshold)) ERR_INSUFFICIENT_TOKENS)
         
         ;; Validate inputs
-        (asserts! (> (len title) u0) ERR_INVALID_PROPOSAL)
-        (asserts! (> (len description) u0) ERR_INVALID_PROPOSAL)
+        (asserts! (validate-proposal-inputs title description) ERR_INVALID_PROPOSAL)
         
         ;; Create proposal
         (map-set proposals { proposal-id: proposal-id }
@@ -251,7 +316,62 @@
                 abstain-votes: u0,
                 state: PROPOSAL_PENDING,
                 executed: false,
-                requires-multisig: requires-multisig
+                requires-multisig: requires-multisig,
+                proposal-type: PROPOSAL_TYPE_GENERAL,
+                treasury-amount: none,
+                treasury-recipient: none
+            })
+        
+        ;; Initialize signature count if multisig required
+        (if requires-multisig
+            (map-set proposal-signature-count { proposal-id: proposal-id } { count: u0 })
+            true)
+        
+        ;; Increment proposal counter
+        (var-set next-proposal-id (+ proposal-id u1))
+        
+        (ok proposal-id)
+    )
+)
+
+(define-public (create-treasury-proposal 
+    (title (string-ascii 100))
+    (description (string-ascii 500))
+    (amount uint)
+    (recipient principal))
+    (let ((proposal-id (var-get next-proposal-id))
+          (start-block (+ stacks-block-height (var-get voting-delay)))
+          (end-block (+ start-block (var-get voting-period)))
+          (proposer-power (get-effective-voting-power tx-sender))
+          (requires-multisig (or (is-high-value-proposal proposer-power) (>= amount (var-get high-value-threshold)))))
+        
+        ;; Validate treasury is set
+        (asserts! (is-some (var-get treasury-contract)) ERR_TREASURY_NOT_SET)
+        
+        ;; Validate proposer has minimum tokens
+        (asserts! (>= proposer-power (var-get proposal-threshold)) ERR_INSUFFICIENT_TOKENS)
+        
+        ;; Validate inputs
+        (asserts! (validate-proposal-inputs title description) ERR_INVALID_PROPOSAL)
+        (asserts! (validate-treasury-params amount recipient) ERR_INVALID_AMOUNT)
+        
+        ;; Create treasury proposal
+        (map-set proposals { proposal-id: proposal-id }
+            {
+                proposer: tx-sender,
+                title: title,
+                description: description,
+                start-block: start-block,
+                end-block: end-block,
+                for-votes: u0,
+                against-votes: u0,
+                abstain-votes: u0,
+                state: PROPOSAL_PENDING,
+                executed: false,
+                requires-multisig: requires-multisig,
+                proposal-type: PROPOSAL_TYPE_TREASURY,
+                treasury-amount: (some amount),
+                treasury-recipient: (some recipient)
             })
         
         ;; Initialize signature count if multisig required
@@ -294,11 +414,16 @@
                 (if (is-eq support u0)
                     (merge proposal-data { against-votes: (+ (get against-votes proposal-data) voting-power) })
                     (if (is-eq support u1)
-                        (let ((new-for-votes (+ (get for-votes proposal-data) voting-power)))
+                        (let ((new-for-votes (+ (get for-votes proposal-data) voting-power))
+                              (check-high-value (or (get requires-multisig proposal-data)
+                                                   (is-high-value-proposal new-for-votes)
+                                                   (and (is-treasury-proposal proposal-id)
+                                                        (match (get treasury-amount proposal-data)
+                                                            amount (>= amount (var-get high-value-threshold))
+                                                            false)))))
                             (merge proposal-data 
                                 { for-votes: new-for-votes,
-                                  requires-multisig: (or (get requires-multisig proposal-data)
-                                                        (is-high-value-proposal new-for-votes)) }))
+                                  requires-multisig: check-high-value }))
                         (merge proposal-data { abstain-votes: (+ (get abstain-votes proposal-data) voting-power) })))))
             (map-set proposals { proposal-id: proposal-id } updated-proposal))
         
@@ -396,6 +521,7 @@
     )
 )
 
+;; Fixed execute-proposal function for general proposals
 (define-public (execute-proposal (proposal-id uint))
     (let ((proposal-data (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND))
           (current-state (unwrap! (update-proposal-state proposal-id) ERR_PROPOSAL_NOT_FOUND)))
@@ -404,11 +530,49 @@
         (asserts! (is-eq current-state PROPOSAL_SUCCEEDED) ERR_PROPOSAL_NOT_ACTIVE)
         (asserts! (not (get executed proposal-data)) ERR_PROPOSAL_NOT_ACTIVE)
         
+        ;; Treasury proposals must use execute-proposal-with-treasury
+        (asserts! (not (is-eq (get proposal-type proposal-data) PROPOSAL_TYPE_TREASURY)) ERR_TREASURY_NOT_SET)
+        
         ;; If multisig required, validate signatures
         (if (get requires-multisig proposal-data)
             (asserts! (>= (get-signature-count proposal-id) (var-get required-signatures)) 
                      ERR_INSUFFICIENT_SIGNATURES)
             true)
+        
+        ;; Mark as executed
+        (map-set proposals { proposal-id: proposal-id }
+            (merge proposal-data { executed: true, state: PROPOSAL_EXECUTED }))
+        
+        (ok true)
+    )
+)
+
+;; New function for executing treasury proposals with trait
+(define-public (execute-proposal-with-treasury (proposal-id uint) (treasury <treasury-trait>))
+    (let ((proposal-data (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND))
+          (current-state (unwrap! (update-proposal-state proposal-id) ERR_PROPOSAL_NOT_FOUND)))
+        
+        ;; Validate proposal can be executed
+        (asserts! (is-eq current-state PROPOSAL_SUCCEEDED) ERR_PROPOSAL_NOT_ACTIVE)
+        (asserts! (not (get executed proposal-data)) ERR_PROPOSAL_NOT_ACTIVE)
+        
+        ;; Only treasury proposals allowed
+        (asserts! (is-eq (get proposal-type proposal-data) PROPOSAL_TYPE_TREASURY) ERR_INVALID_PROPOSAL)
+        
+        ;; If multisig required, validate signatures
+        (if (get requires-multisig proposal-data)
+            (asserts! (>= (get-signature-count proposal-id) (var-get required-signatures)) 
+                     ERR_INSUFFICIENT_SIGNATURES)
+            true)
+        
+        ;; Execute treasury transfer
+        (let ((amount (unwrap! (get treasury-amount proposal-data) ERR_INVALID_AMOUNT))
+              (recipient (unwrap! (get treasury-recipient proposal-data) ERR_INVALID_RECIPIENT)))
+            ;; Perform treasury transfer and handle result
+            (unwrap! (contract-call? treasury transfer-funds amount recipient none) ERR_TREASURY_EXECUTION_FAILED)
+            ;; Record successful execution
+            (map-set treasury-executions { proposal-id: proposal-id }
+                { executed: true, execution-block: stacks-block-height, amount: amount, recipient: recipient }))
         
         ;; Mark as executed
         (map-set proposals { proposal-id: proposal-id }
@@ -474,6 +638,34 @@
         
         ;; Decrement guardian count
         (var-set guardian-count (- (var-get guardian-count) u1))
+        
+        (ok true)
+    )
+)
+
+;; Treasury management functions
+(define-public (set-treasury-contract (treasury principal))
+    (begin
+        ;; Only contract owner can set treasury
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        
+        ;; Validate treasury contract is not zero address
+        (asserts! (not (is-eq treasury (as-contract tx-sender))) ERR_INVALID_TREASURY_CONTRACT)
+        
+        ;; Set treasury contract
+        (var-set treasury-contract (some treasury))
+        
+        (ok true)
+    )
+)
+
+(define-public (remove-treasury-contract)
+    (begin
+        ;; Only contract owner can remove treasury
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        
+        ;; Remove treasury contract
+        (var-set treasury-contract none)
         
         (ok true)
     )
