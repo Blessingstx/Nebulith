@@ -1,5 +1,6 @@
 ;; Nebulith - Decentralized Voting in the Cosmic DAO
 ;; A permissionless DAO framework enabling decentralized governance via token-weighted voting
+;; with multi-signature proposal execution for enhanced security
 
 ;; Constants
 (define-constant CONTRACT_OWNER tx-sender)
@@ -13,6 +14,12 @@
 (define-constant ERR_QUORUM_NOT_MET (err u107))
 (define-constant ERR_INVALID_PROPOSAL (err u108))
 (define-constant ERR_VOTING_DELAY_NOT_PASSED (err u109))
+(define-constant ERR_NOT_GUARDIAN (err u110))
+(define-constant ERR_ALREADY_SIGNED (err u111))
+(define-constant ERR_INSUFFICIENT_SIGNATURES (err u112))
+(define-constant ERR_GUARDIAN_EXISTS (err u113))
+(define-constant ERR_GUARDIAN_NOT_FOUND (err u114))
+(define-constant ERR_MIN_GUARDIANS_REQUIRED (err u115))
 
 ;; Data Variables
 (define-data-var next-proposal-id uint u1)
@@ -20,6 +27,9 @@
 (define-data-var voting-delay uint u144) ;; ~1 day in blocks
 (define-data-var voting-period uint u1008) ;; ~1 week in blocks
 (define-data-var proposal-threshold uint u100000) ;; 100k tokens to create proposal
+(define-data-var high-value-threshold uint u10000000) ;; 10M tokens - requires multisig
+(define-data-var required-signatures uint u2) ;; Minimum signatures required
+(define-data-var guardian-count uint u0) ;; Current number of guardians
 
 ;; Proposal States
 (define-constant PROPOSAL_PENDING u0)
@@ -28,6 +38,7 @@
 (define-constant PROPOSAL_DEFEATED u3)
 (define-constant PROPOSAL_EXECUTED u4)
 (define-constant PROPOSAL_VETOED u5)
+(define-constant PROPOSAL_AWAITING_SIGNATURES u6)
 
 ;; Data Maps
 (define-map proposals
@@ -42,7 +53,8 @@
         against-votes: uint,
         abstain-votes: uint,
         state: uint,
-        executed: bool
+        executed: bool,
+        requires-multisig: bool
     }
 )
 
@@ -59,6 +71,22 @@
 (define-map delegation-power
     { delegate: principal }
     { total-delegated: uint }
+)
+
+;; Multi-signature related maps
+(define-map guardians
+    { guardian: principal }
+    { active: bool, added-at: uint }
+)
+
+(define-map proposal-signatures
+    { proposal-id: uint, guardian: principal }
+    { signed: bool, signed-at: uint }
+)
+
+(define-map proposal-signature-count
+    { proposal-id: uint }
+    { count: uint }
 )
 
 ;; Governance token trait (SIP-010 compatible)
@@ -126,6 +154,36 @@
     )
 )
 
+(define-read-only (is-guardian (guardian principal))
+    (match (map-get? guardians { guardian: guardian })
+        guardian-data (get active guardian-data)
+        false
+    )
+)
+
+(define-read-only (has-signed (proposal-id uint) (guardian principal))
+    (match (map-get? proposal-signatures { proposal-id: proposal-id, guardian: guardian })
+        signature-data (get signed signature-data)
+        false
+    )
+)
+
+(define-read-only (get-signature-count (proposal-id uint))
+    (default-to u0
+        (get count (map-get? proposal-signature-count { proposal-id: proposal-id })))
+)
+
+(define-read-only (requires-multisig (proposal-id uint))
+    (match (get-proposal proposal-id)
+        proposal (get requires-multisig proposal)
+        false
+    )
+)
+
+(define-read-only (is-high-value-proposal (for-votes uint))
+    (>= for-votes (var-get high-value-threshold))
+)
+
 ;; Private functions
 (define-private (get-effective-voting-power (voter principal))
     (let ((voter-data (get-voter-power voter)))
@@ -144,14 +202,23 @@
             (if (< current-block (get end-block proposal-data))
                 (ok PROPOSAL_ACTIVE)
                 (if (proposal-succeeded proposal-id)
-                    (begin
+                    (let ((new-state (if (get requires-multisig proposal-data)
+                                        PROPOSAL_AWAITING_SIGNATURES
+                                        PROPOSAL_SUCCEEDED)))
                         (map-set proposals { proposal-id: proposal-id }
-                            (merge proposal-data { state: PROPOSAL_SUCCEEDED }))
-                        (ok PROPOSAL_SUCCEEDED))
+                            (merge proposal-data { state: new-state }))
+                        (ok new-state))
                     (begin
                         (map-set proposals { proposal-id: proposal-id }
                             (merge proposal-data { state: PROPOSAL_DEFEATED }))
                         (ok PROPOSAL_DEFEATED))))))
+)
+
+(define-private (increment-signature-count (proposal-id uint))
+    (let ((current-count (get-signature-count proposal-id)))
+        (map-set proposal-signature-count { proposal-id: proposal-id }
+            { count: (+ current-count u1) })
+        (+ current-count u1))
 )
 
 ;; Public functions
@@ -161,7 +228,8 @@
     (let ((proposal-id (var-get next-proposal-id))
           (start-block (+ stacks-block-height (var-get voting-delay)))
           (end-block (+ start-block (var-get voting-period)))
-          (proposer-power (get-effective-voting-power tx-sender)))
+          (proposer-power (get-effective-voting-power tx-sender))
+          (requires-multisig (is-high-value-proposal proposer-power)))
         
         ;; Validate proposer has minimum tokens
         (asserts! (>= proposer-power (var-get proposal-threshold)) ERR_INSUFFICIENT_TOKENS)
@@ -182,8 +250,14 @@
                 against-votes: u0,
                 abstain-votes: u0,
                 state: PROPOSAL_PENDING,
-                executed: false
+                executed: false,
+                requires-multisig: requires-multisig
             })
+        
+        ;; Initialize signature count if multisig required
+        (if requires-multisig
+            (map-set proposal-signature-count { proposal-id: proposal-id } { count: u0 })
+            true)
         
         ;; Increment proposal counter
         (var-set next-proposal-id (+ proposal-id u1))
@@ -215,14 +289,47 @@
         (map-set votes { proposal-id: proposal-id, voter: tx-sender }
             { support: support, weight: voting-power, voted-at: current-block })
         
-        ;; Update proposal vote counts
+        ;; Update proposal vote counts and check if it becomes high-value
         (let ((updated-proposal
                 (if (is-eq support u0)
                     (merge proposal-data { against-votes: (+ (get against-votes proposal-data) voting-power) })
                     (if (is-eq support u1)
-                        (merge proposal-data { for-votes: (+ (get for-votes proposal-data) voting-power) })
+                        (let ((new-for-votes (+ (get for-votes proposal-data) voting-power)))
+                            (merge proposal-data 
+                                { for-votes: new-for-votes,
+                                  requires-multisig: (or (get requires-multisig proposal-data)
+                                                        (is-high-value-proposal new-for-votes)) }))
                         (merge proposal-data { abstain-votes: (+ (get abstain-votes proposal-data) voting-power) })))))
             (map-set proposals { proposal-id: proposal-id } updated-proposal))
+        
+        (ok true)
+    )
+)
+
+(define-public (sign-proposal (proposal-id uint))
+    (let ((proposal-data (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND))
+          (current-state (unwrap! (update-proposal-state proposal-id) ERR_PROPOSAL_NOT_FOUND)))
+        
+        ;; Validate caller is a guardian
+        (asserts! (is-guardian tx-sender) ERR_NOT_GUARDIAN)
+        
+        ;; Validate proposal is awaiting signatures
+        (asserts! (is-eq current-state PROPOSAL_AWAITING_SIGNATURES) ERR_PROPOSAL_NOT_ACTIVE)
+        
+        ;; Validate guardian hasn't already signed
+        (asserts! (not (has-signed proposal-id tx-sender)) ERR_ALREADY_SIGNED)
+        
+        ;; Record signature
+        (map-set proposal-signatures { proposal-id: proposal-id, guardian: tx-sender }
+            { signed: true, signed-at: stacks-block-height })
+        
+        ;; Increment signature count
+        (let ((new-count (increment-signature-count proposal-id)))
+            ;; Check if we have enough signatures to mark as succeeded
+            (if (>= new-count (var-get required-signatures))
+                (map-set proposals { proposal-id: proposal-id }
+                    (merge proposal-data { state: PROPOSAL_SUCCEEDED }))
+                true))
         
         (ok true)
     )
@@ -297,6 +404,12 @@
         (asserts! (is-eq current-state PROPOSAL_SUCCEEDED) ERR_PROPOSAL_NOT_ACTIVE)
         (asserts! (not (get executed proposal-data)) ERR_PROPOSAL_NOT_ACTIVE)
         
+        ;; If multisig required, validate signatures
+        (if (get requires-multisig proposal-data)
+            (asserts! (>= (get-signature-count proposal-id) (var-get required-signatures)) 
+                     ERR_INSUFFICIENT_SIGNATURES)
+            true)
+        
         ;; Mark as executed
         (map-set proposals { proposal-id: proposal-id }
             (merge proposal-data { executed: true, state: PROPOSAL_EXECUTED }))
@@ -320,6 +433,47 @@
         ;; Mark as vetoed
         (map-set proposals { proposal-id: proposal-id }
             (merge proposal-data { state: PROPOSAL_VETOED }))
+        
+        (ok true)
+    )
+)
+
+;; Guardian management functions
+(define-public (add-guardian (new-guardian principal))
+    (begin
+        ;; Only contract owner can add guardians
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        
+        ;; Validate guardian doesn't already exist
+        (asserts! (not (is-guardian new-guardian)) ERR_GUARDIAN_EXISTS)
+        
+        ;; Add guardian
+        (map-set guardians { guardian: new-guardian }
+            { active: true, added-at: stacks-block-height })
+        
+        ;; Increment guardian count
+        (var-set guardian-count (+ (var-get guardian-count) u1))
+        
+        (ok true)
+    )
+)
+
+(define-public (remove-guardian (guardian principal))
+    (begin
+        ;; Only contract owner can remove guardians
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        
+        ;; Validate guardian exists
+        (asserts! (is-guardian guardian) ERR_GUARDIAN_NOT_FOUND)
+        
+        ;; Ensure minimum guardians remain
+        (asserts! (> (var-get guardian-count) (var-get required-signatures)) ERR_MIN_GUARDIANS_REQUIRED)
+        
+        ;; Remove guardian
+        (map-delete guardians { guardian: guardian })
+        
+        ;; Decrement guardian count
+        (var-set guardian-count (- (var-get guardian-count) u1))
         
         (ok true)
     )
@@ -362,6 +516,26 @@
         (asserts! (> new-threshold u0) ERR_INVALID_PROPOSAL)
         (asserts! (<= new-threshold u1000000000000) ERR_INVALID_PROPOSAL) ;; Max reasonable threshold
         (var-set proposal-threshold new-threshold)
+        (ok true)
+    )
+)
+
+(define-public (set-high-value-threshold (new-threshold uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (> new-threshold u0) ERR_INVALID_PROPOSAL)
+        (asserts! (<= new-threshold u1000000000000) ERR_INVALID_PROPOSAL)
+        (var-set high-value-threshold new-threshold)
+        (ok true)
+    )
+)
+
+(define-public (set-required-signatures (new-requirement uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (> new-requirement u0) ERR_INVALID_PROPOSAL)
+        (asserts! (<= new-requirement (var-get guardian-count)) ERR_INVALID_PROPOSAL)
+        (var-set required-signatures new-requirement)
         (ok true)
     )
 )
