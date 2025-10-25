@@ -6,7 +6,8 @@ A permissionless DAO framework built on Stacks blockchain that enables decentral
 
 ### Core Governance
 - **Token-weighted voting** with SIP-010 token support
-- **Proposal lifecycle management** with multiple states (Pending, Active, Succeeded, Defeated, Executed, Vetoed, Awaiting Signatures)
+- **Proposal lifecycle management** with multiple states (Pending, Active, Succeeded, Defeated, Executed, Vetoed, Awaiting Signatures, Cancelled)
+- **Proposal cancellation** allowing proposers to cancel their own proposals before execution
 - **Configurable governance parameters** (quorum thresholds, voting delays, proposal thresholds)
 - **Voting delegation system** allowing token holders to delegate voting power
 - **Comprehensive security checks** to prevent governance attacks
@@ -17,6 +18,7 @@ A permissionless DAO framework built on Stacks blockchain that enables decentral
 - **General Proposals**: Create proposals for governance decisions with title and description
 - **Treasury Proposals**: Create proposals for fund allocation with specified amounts and recipients
 - **Parameter Proposals**: Modify governance parameters through community voting
+- **Proposal Cancellation**: Proposers can cancel their own pending or active proposals
 - Automatic state transitions based on voting outcomes
 - Quorum requirements for proposal validity
 - Voting delay mechanism to prevent flash loan attacks
@@ -38,11 +40,12 @@ A permissionless DAO framework built on Stacks blockchain that enables decentral
 - Protection against double voting and unauthorized access
 - Minimum token requirements for proposal creation
 - Veto mechanism for emergency governance intervention
+- **Proposal cancellation controls** to prevent abuse while allowing flexibility
 - **Multi-signature guardian system** for high-value and treasury proposals
 - **Configurable signature thresholds** for different security levels
 - **Guardian management** with proper access controls and minimum requirements
 - **Treasury contract validation** to ensure secure fund management
-- Proper error handling throughout the contract with specific treasury-related error codes
+- Proper error handling throughout the contract with specific error codes
 
 ### Multi-Signature System
 - **Guardian Management**: Designated guardians can sign high-value and treasury proposals
@@ -70,14 +73,14 @@ A permissionless DAO framework built on Stacks blockchain that enables decentral
 - **Required Signatures**: 2 guardians (configurable)
 
 ### Data Structures
-- `proposals`: Enhanced with treasury proposal support, amounts, and recipients
+- `proposals`: Enhanced with treasury proposal support, amounts, recipients, and cancellation tracking
 - `votes`: Records individual voting decisions
 - `voter-power`: Manages token holder voting power and delegations
 - `delegation-power`: Tracks total delegated voting power
 - `guardians`: Manages guardian registry and status
 - `proposal-signatures`: Records guardian signatures for proposals
 - `proposal-signature-count`: Tracks signature counts for multi-signature proposals
-- `treasury-executions`: **NEW** - Tracks treasury fund transfers and execution details
+- `treasury-executions`: Tracks treasury fund transfers and execution details
 
 ### Treasury Contract Integration
 - **Treasury Trait**: Defines interface for compatible treasury contracts
@@ -101,6 +104,12 @@ A permissionless DAO framework built on Stacks blockchain that enables decentral
     "Proposal to allocate 1M tokens for development"
     u1000000    ;; Amount in micro-tokens
     'SP1EXAMPLE) ;; Recipient address
+```
+
+### Cancelling Proposals
+```clarity
+;; Proposers can cancel their own pending or active proposals
+(contract-call? .nebulith cancel-proposal proposal-id)
 ```
 
 ### Casting Votes
@@ -144,8 +153,11 @@ A permissionless DAO framework built on Stacks blockchain that enables decentral
 
 ### Executing Proposals
 ```clarity
-;; Execute any proposal (automatically handles treasury transfers)
+;; Execute general proposal
 (contract-call? .nebulith execute-proposal proposal-id)
+
+;; Execute treasury proposal with treasury trait
+(contract-call? .nebulith execute-proposal-with-treasury proposal-id treasury-contract)
 ```
 
 ## Installation & Deployment
@@ -200,6 +212,29 @@ The contract passes `clarinet check` without warnings and includes comprehensive
 - **Execution Tracking**: Comprehensive logging of all treasury operations
 - **Emergency Controls**: Veto mechanism for problematic treasury proposals
 
+## Proposal Cancellation Workflow
+
+### Cancellation Process
+1. **Authorization Check**: Only the original proposer can cancel their proposal
+2. **State Validation**: Only pending or active proposals can be cancelled
+3. **Execution Check**: Already executed proposals cannot be cancelled
+4. **Timestamp Recording**: Cancellation time is recorded on-chain
+5. **State Update**: Proposal state is updated to CANCELLED
+
+### Cancellation Rules
+- **Proposer Only**: Only the original proposer can cancel their proposal
+- **Time Window**: Can cancel during pending or active voting periods
+- **No Refunds**: Proposal threshold tokens are not refunded upon cancellation
+- **Permanent**: Cancelled proposals cannot be reactivated
+- **Audit Trail**: Cancellation timestamp is permanently recorded
+
+### Use Cases for Cancellation
+- **Error Correction**: Proposer made a mistake in proposal details
+- **Changed Circumstances**: External conditions have changed
+- **Community Feedback**: Negative community response before voting concludes
+- **Better Alternative**: A superior proposal has been submitted
+- **Testing**: Remove test proposals in development environments
+
 ## Multi-Signature Workflow
 
 ### High-Value and Treasury Proposal Process
@@ -221,6 +256,7 @@ The contract passes `clarinet check` without warnings and includes comprehensive
 - Double voting protection is implemented
 - Delegation system prevents voting power manipulation
 - Emergency veto mechanism for critical situations
+- **Proposal cancellation** provides flexibility while preventing abuse
 - **Multi-signature protection** for high-value and treasury proposals
 - **Guardian access controls** prevent unauthorized signatures
 - **Minimum guardian requirements** ensure system resilience
@@ -229,7 +265,14 @@ The contract passes `clarinet check` without warnings and includes comprehensive
 
 ## API Reference
 
-### New Treasury Management Functions
+### New Proposal Management Functions
+
+#### Proposal Cancellation
+- `cancel-proposal(proposal-id)` - Cancel own pending/active proposal
+- `is-proposal-cancelled(proposal-id)` - Check if proposal is cancelled
+- `can-cancel-proposal(proposal-id, caller)` - Check if caller can cancel proposal
+
+### Treasury Management Functions
 
 #### Treasury Proposal Creation
 - `create-treasury-proposal(title, description, amount, recipient)` - Create treasury funding proposal
@@ -241,15 +284,16 @@ The contract passes `clarinet check` without warnings and includes comprehensive
 - `remove-treasury-contract()` - Remove treasury contract
 - `get-treasury-contract()` - Get current treasury contract
 
-#### Enhanced Proposal Functions
-- `execute-proposal(proposal-id)` - Execute proposal (handles treasury transfers automatically)
+#### Proposal Execution
+- `execute-proposal(proposal-id)` - Execute general proposal
+- `execute-proposal-with-treasury(proposal-id, treasury)` - Execute treasury proposal with trait
 
 ### Enhanced Read-Only Functions
 - `requires-multisig(proposal-id)` - Check if proposal requires multi-signature
 - `is-high-value-proposal(for-votes)` - Check if vote count triggers multi-signature
 - `get-treasury-contract()` - Get configured treasury contract address
 
-### Multi-Signature Functions (Existing)
+### Multi-Signature Functions
 - `add-guardian(guardian)` - Add new guardian
 - `remove-guardian(guardian)` - Remove existing guardian
 - `sign-proposal(proposal-id)` - Sign proposal as guardian
@@ -258,14 +302,18 @@ The contract passes `clarinet check` without warnings and includes comprehensive
 
 ## Error Codes
 
-### New Treasury Error Codes
+### New Error Codes
+- `ERR_PROPOSAL_ALREADY_EXECUTED (u121)` - Proposal has already been executed
+- `ERR_CANNOT_CANCEL (u122)` - Proposal cannot be cancelled in current state
+
+### Treasury Error Codes
 - `ERR_INVALID_TREASURY_CONTRACT (u116)` - Invalid treasury contract address
 - `ERR_TREASURY_EXECUTION_FAILED (u117)` - Treasury fund transfer failed
 - `ERR_INVALID_AMOUNT (u118)` - Invalid treasury amount specified
 - `ERR_INVALID_RECIPIENT (u119)` - Invalid recipient for treasury transfer
 - `ERR_TREASURY_NOT_SET (u120)` - Treasury contract not configured
 
-### Multi-Signature Error Codes (Existing)
+### Multi-Signature Error Codes
 - `ERR_NOT_GUARDIAN (u110)` - Caller is not a registered guardian
 - `ERR_ALREADY_SIGNED (u111)` - Guardian has already signed this proposal
 - `ERR_INSUFFICIENT_SIGNATURES (u112)` - Not enough guardian signatures collected
@@ -283,20 +331,30 @@ We welcome contributions! Please see our contributing guidelines and submit pull
 - Test coverage expansion
 - Multi-signature system enhancements
 - Guardian management improvements
-- **Treasury integration improvements**
-- **New treasury contract implementations**
+- Treasury integration improvements
+- New treasury contract implementations
+- Proposal lifecycle enhancements
 
 ## Recent Updates
 
-### v3.0 - Treasury Management Integration
-- **Direct Treasury Contract Integration**: Seamless connection with multi-signature treasury contracts
-- **Treasury Proposal System**: Specialized proposals for fund allocation with comprehensive validation
-- **Automated Fund Execution**: Successful treasury proposals automatically trigger secure fund transfers
-- **Enhanced Multi-Signature Support**: Treasury proposals integrate with existing guardian approval system
-- **Execution Tracking**: Detailed logging and monitoring of all treasury operations
-- **Flexible Configuration**: Dynamic treasury contract setup and management
-- **Security Enhancements**: Additional validation layers for treasury operations and fund protection
-- **Comprehensive API**: Extended API for treasury management and monitoring
+### v3.1 - Proposal Cancellation & Enhanced Security
+- **Proposal Cancellation**: Proposers can now cancel their own pending or active proposals
+- **Enhanced State Management**: Added CANCELLED state to proposal lifecycle
+- **Cancellation Tracking**: On-chain timestamp recording for cancelled proposals
+- **Improved Error Handling**: New error codes for execution and cancellation states
+- **Security Enhancements**: Additional validation to prevent abuse of cancellation feature
+- **Better User Control**: Gives proposers flexibility to correct mistakes or respond to feedback
+- **Audit Trail**: Complete cancellation history with timestamps for transparency
+
+### v3.0 - Treasury Management Integration (Previous)
+- Direct Treasury Contract Integration with multi-signature treasury contracts
+- Treasury Proposal System for fund allocation with comprehensive validation
+- Automated Fund Execution for successful treasury proposals
+- Enhanced Multi-Signature Support integrated with guardian approval
+- Execution Tracking with detailed logging and monitoring
+- Flexible Configuration for dynamic treasury contract setup
+- Security Enhancements with additional validation layers
+- Comprehensive API extended for treasury management
 
 ### v2.0 - Multi-Signature Proposal Execution (Previous)
 - Added guardian management system
@@ -306,4 +364,4 @@ We welcome contributions! Please see our contributing guidelines and submit pull
 - Improved security with guardian-based proposal approval
 - Enhanced API with guardian and signature management functions
 
-*Nebulith: Empowering decentralized communities through secure, transparent governance with enhanced multi-signature protection and integrated treasury management.*
+*Nebulith: Empowering decentralized communities through secure, transparent governance with enhanced multi-signature protection, integrated treasury management, and flexible proposal lifecycle controls.*

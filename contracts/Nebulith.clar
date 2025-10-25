@@ -25,6 +25,8 @@
 (define-constant ERR_INVALID_AMOUNT (err u118))
 (define-constant ERR_INVALID_RECIPIENT (err u119))
 (define-constant ERR_TREASURY_NOT_SET (err u120))
+(define-constant ERR_PROPOSAL_ALREADY_EXECUTED (err u121))
+(define-constant ERR_CANNOT_CANCEL (err u122))
 
 ;; Data Variables
 (define-data-var next-proposal-id uint u1)
@@ -45,6 +47,7 @@
 (define-constant PROPOSAL_EXECUTED u4)
 (define-constant PROPOSAL_VETOED u5)
 (define-constant PROPOSAL_AWAITING_SIGNATURES u6)
+(define-constant PROPOSAL_CANCELLED u7)
 
 ;; Proposal Types
 (define-constant PROPOSAL_TYPE_GENERAL u0)
@@ -90,7 +93,8 @@
         requires-multisig: bool,
         proposal-type: uint,
         treasury-amount: (optional uint),
-        treasury-recipient: (optional principal)
+        treasury-recipient: (optional principal),
+        cancelled-at: (optional uint)
     }
 )
 
@@ -228,34 +232,55 @@
     (map-get? treasury-executions { proposal-id: proposal-id })
 )
 
+(define-read-only (is-proposal-cancelled (proposal-id uint))
+    (match (get-proposal proposal-id)
+        proposal (is-eq (get state proposal) PROPOSAL_CANCELLED)
+        false
+    )
+)
+
+(define-read-only (can-cancel-proposal (proposal-id uint) (caller principal))
+    (match (get-proposal proposal-id)
+        proposal (and 
+            (is-eq (get proposer proposal) caller)
+            (or (is-eq (get state proposal) PROPOSAL_PENDING)
+                (is-eq (get state proposal) PROPOSAL_ACTIVE))
+            (not (get executed proposal))
+            (is-none (get cancelled-at proposal)))
+        false
+    )
+)
+
 ;; Private functions
 (define-private (get-effective-voting-power (voter principal))
     (let ((voter-data (get-voter-power voter)))
         (match (get delegated-to voter-data)
-            delegate u0  ;; If delegated, voter has no direct power
-            (get-voting-power voter)  ;; Otherwise, use full voting power
+            delegate u0
+            (get-voting-power voter)
         )
     )
 )
 
 (define-private (update-proposal-state (proposal-id uint))
-    (let ((current-block stacks-block-height)
-          (proposal-data (unwrap! (get-proposal proposal-id) (err ERR_PROPOSAL_NOT_FOUND))))
-        (if (< current-block (get start-block proposal-data))
-            (ok PROPOSAL_PENDING)
-            (if (< current-block (get end-block proposal-data))
-                (ok PROPOSAL_ACTIVE)
-                (if (proposal-succeeded proposal-id)
-                    (let ((new-state (if (get requires-multisig proposal-data)
-                                        PROPOSAL_AWAITING_SIGNATURES
-                                        PROPOSAL_SUCCEEDED)))
-                        (map-set proposals { proposal-id: proposal-id }
-                            (merge proposal-data { state: new-state }))
-                        (ok new-state))
-                    (begin
-                        (map-set proposals { proposal-id: proposal-id }
-                            (merge proposal-data { state: PROPOSAL_DEFEATED }))
-                        (ok PROPOSAL_DEFEATED))))))
+    (let ((current-block stacks-block-height))
+        (match (get-proposal proposal-id)
+            proposal-data
+            (if (< current-block (get start-block proposal-data))
+                (ok PROPOSAL_PENDING)
+                (if (< current-block (get end-block proposal-data))
+                    (ok PROPOSAL_ACTIVE)
+                    (if (proposal-succeeded proposal-id)
+                        (let ((new-state (if (get requires-multisig proposal-data)
+                                            PROPOSAL_AWAITING_SIGNATURES
+                                            PROPOSAL_SUCCEEDED)))
+                            (map-set proposals { proposal-id: proposal-id }
+                                (merge proposal-data { state: new-state }))
+                            (ok new-state))
+                        (begin
+                            (map-set proposals { proposal-id: proposal-id }
+                                (merge proposal-data { state: PROPOSAL_DEFEATED }))
+                            (ok PROPOSAL_DEFEATED)))))
+            (err ERR_PROPOSAL_NOT_FOUND)))
 )
 
 (define-private (increment-signature-count (proposal-id uint))
@@ -274,12 +299,11 @@
 
 (define-private (validate-treasury-params (amount uint) (recipient principal))
     (and (> amount u0)
-         (<= amount u1000000000000) ;; Max reasonable amount
-         (not (is-eq recipient (as-contract tx-sender))) ;; Cannot send to self
-         (not (is-eq recipient CONTRACT_OWNER))) ;; Cannot send to owner
+         (<= amount u1000000000000)
+         (not (is-eq recipient (as-contract tx-sender)))
+         (not (is-eq recipient CONTRACT_OWNER)))
 )
 
-;; Fixed treasury transfer function - no dynamic contract calls
 (define-private (prepare-treasury-execution (proposal-id uint) (amount uint) (recipient principal))
     (begin
         (map-set treasury-executions { proposal-id: proposal-id }
@@ -297,13 +321,9 @@
           (proposer-power (get-effective-voting-power tx-sender))
           (requires-multisig (is-high-value-proposal proposer-power)))
         
-        ;; Validate proposer has minimum tokens
         (asserts! (>= proposer-power (var-get proposal-threshold)) ERR_INSUFFICIENT_TOKENS)
-        
-        ;; Validate inputs
         (asserts! (validate-proposal-inputs title description) ERR_INVALID_PROPOSAL)
         
-        ;; Create proposal
         (map-set proposals { proposal-id: proposal-id }
             {
                 proposer: tx-sender,
@@ -319,15 +339,14 @@
                 requires-multisig: requires-multisig,
                 proposal-type: PROPOSAL_TYPE_GENERAL,
                 treasury-amount: none,
-                treasury-recipient: none
+                treasury-recipient: none,
+                cancelled-at: none
             })
         
-        ;; Initialize signature count if multisig required
         (if requires-multisig
             (map-set proposal-signature-count { proposal-id: proposal-id } { count: u0 })
             true)
         
-        ;; Increment proposal counter
         (var-set next-proposal-id (+ proposal-id u1))
         
         (ok proposal-id)
@@ -345,17 +364,11 @@
           (proposer-power (get-effective-voting-power tx-sender))
           (requires-multisig (or (is-high-value-proposal proposer-power) (>= amount (var-get high-value-threshold)))))
         
-        ;; Validate treasury is set
         (asserts! (is-some (var-get treasury-contract)) ERR_TREASURY_NOT_SET)
-        
-        ;; Validate proposer has minimum tokens
         (asserts! (>= proposer-power (var-get proposal-threshold)) ERR_INSUFFICIENT_TOKENS)
-        
-        ;; Validate inputs
         (asserts! (validate-proposal-inputs title description) ERR_INVALID_PROPOSAL)
         (asserts! (validate-treasury-params amount recipient) ERR_INVALID_AMOUNT)
         
-        ;; Create treasury proposal
         (map-set proposals { proposal-id: proposal-id }
             {
                 proposer: tx-sender,
@@ -371,18 +384,33 @@
                 requires-multisig: requires-multisig,
                 proposal-type: PROPOSAL_TYPE_TREASURY,
                 treasury-amount: (some amount),
-                treasury-recipient: (some recipient)
+                treasury-recipient: (some recipient),
+                cancelled-at: none
             })
         
-        ;; Initialize signature count if multisig required
         (if requires-multisig
             (map-set proposal-signature-count { proposal-id: proposal-id } { count: u0 })
             true)
         
-        ;; Increment proposal counter
         (var-set next-proposal-id (+ proposal-id u1))
         
         (ok proposal-id)
+    )
+)
+
+(define-public (cancel-proposal (proposal-id uint))
+    (let ((proposal-data (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND)))
+        
+        (asserts! (is-eq (get proposer proposal-data) tx-sender) ERR_UNAUTHORIZED)
+        (asserts! (can-cancel-proposal proposal-id tx-sender) ERR_CANNOT_CANCEL)
+        
+        (map-set proposals { proposal-id: proposal-id }
+            (merge proposal-data { 
+                state: PROPOSAL_CANCELLED,
+                cancelled-at: (some stacks-block-height)
+            }))
+        
+        (ok true)
     )
 )
 
@@ -391,25 +419,16 @@
           (available-power (get-effective-voting-power tx-sender))
           (current-block stacks-block-height))
         
-        ;; Validate voting period
         (asserts! (>= current-block (get start-block proposal-data)) ERR_VOTING_PERIOD_NOT_STARTED)
         (asserts! (< current-block (get end-block proposal-data)) ERR_VOTING_PERIOD_ENDED)
-        
-        ;; Validate voter hasn't voted
         (asserts! (not (has-voted proposal-id tx-sender)) ERR_ALREADY_VOTED)
-        
-        ;; Validate voting power
         (asserts! (>= available-power voting-power) ERR_INSUFFICIENT_TOKENS)
         (asserts! (> voting-power u0) ERR_INSUFFICIENT_TOKENS)
-        
-        ;; Validate support value (0=against, 1=for, 2=abstain)
         (asserts! (<= support u2) ERR_INVALID_PROPOSAL)
         
-        ;; Record vote
         (map-set votes { proposal-id: proposal-id, voter: tx-sender }
             { support: support, weight: voting-power, voted-at: current-block })
         
-        ;; Update proposal vote counts and check if it becomes high-value
         (let ((updated-proposal
                 (if (is-eq support u0)
                     (merge proposal-data { against-votes: (+ (get against-votes proposal-data) voting-power) })
@@ -435,22 +454,14 @@
     (let ((proposal-data (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND))
           (current-state (unwrap! (update-proposal-state proposal-id) ERR_PROPOSAL_NOT_FOUND)))
         
-        ;; Validate caller is a guardian
         (asserts! (is-guardian tx-sender) ERR_NOT_GUARDIAN)
-        
-        ;; Validate proposal is awaiting signatures
         (asserts! (is-eq current-state PROPOSAL_AWAITING_SIGNATURES) ERR_PROPOSAL_NOT_ACTIVE)
-        
-        ;; Validate guardian hasn't already signed
         (asserts! (not (has-signed proposal-id tx-sender)) ERR_ALREADY_SIGNED)
         
-        ;; Record signature
         (map-set proposal-signatures { proposal-id: proposal-id, guardian: tx-sender }
             { signed: true, signed-at: stacks-block-height })
         
-        ;; Increment signature count
         (let ((new-count (increment-signature-count proposal-id)))
-            ;; Check if we have enough signatures to mark as succeeded
             (if (>= new-count (var-get required-signatures))
                 (map-set proposals { proposal-id: proposal-id }
                     (merge proposal-data { state: PROPOSAL_SUCCEEDED }))
@@ -464,16 +475,13 @@
     (let ((current-power (get power (get-voter-power tx-sender)))
           (current-delegation (get total-delegated (get-delegation-power delegate-to))))
         
-        ;; Validate delegation power
         (asserts! (>= current-power power) ERR_INSUFFICIENT_TOKENS)
         (asserts! (> power u0) ERR_INSUFFICIENT_TOKENS)
         (asserts! (not (is-eq tx-sender delegate-to)) ERR_UNAUTHORIZED)
         
-        ;; Update delegator's power
         (map-set voter-power { voter: tx-sender }
             { power: (- current-power power), delegated-to: (some delegate-to) })
         
-        ;; Update delegate's power
         (map-set delegation-power { delegate: delegate-to }
             { total-delegated: (+ current-delegation power) })
         
@@ -485,16 +493,13 @@
     (let ((voter-data (get-voter-power tx-sender))
           (current-delegation (get total-delegated (get-delegation-power delegate-from))))
         
-        ;; Validate caller has delegated to this delegate
         (asserts! (is-eq (get delegated-to voter-data) (some delegate-from)) ERR_UNAUTHORIZED)
         (asserts! (>= current-delegation power) ERR_INSUFFICIENT_TOKENS)
         (asserts! (> power u0) ERR_INSUFFICIENT_TOKENS)
         
-        ;; Update voter's power
         (map-set voter-power { voter: tx-sender }
             { power: (+ (get power voter-data) power), delegated-to: none })
         
-        ;; Update delegate's power
         (map-set delegation-power { delegate: delegate-from }
             { total-delegated: (- current-delegation power) })
         
@@ -504,15 +509,10 @@
 
 (define-public (set-initial-voting-power (voter principal) (power uint))
     (begin
-        ;; Only contract owner can set initial voting power
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-        
-        ;; Validate voter principal is not contract owner (prevent self-manipulation)
         (asserts! (not (is-eq voter CONTRACT_OWNER)) ERR_UNAUTHORIZED)
-        
-        ;; Validate power amount
         (asserts! (> power u0) ERR_INSUFFICIENT_TOKENS)
-        (asserts! (<= power u1000000000000) ERR_INSUFFICIENT_TOKENS) ;; Max reasonable power
+        (asserts! (<= power u1000000000000) ERR_INSUFFICIENT_TOKENS)
         
         (map-set voter-power { voter: voter }
             { power: power, delegated-to: none })
@@ -521,25 +521,19 @@
     )
 )
 
-;; Fixed execute-proposal function for general proposals
 (define-public (execute-proposal (proposal-id uint))
     (let ((proposal-data (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND))
           (current-state (unwrap! (update-proposal-state proposal-id) ERR_PROPOSAL_NOT_FOUND)))
         
-        ;; Validate proposal can be executed
         (asserts! (is-eq current-state PROPOSAL_SUCCEEDED) ERR_PROPOSAL_NOT_ACTIVE)
-        (asserts! (not (get executed proposal-data)) ERR_PROPOSAL_NOT_ACTIVE)
-        
-        ;; Treasury proposals must use execute-proposal-with-treasury
+        (asserts! (not (get executed proposal-data)) ERR_PROPOSAL_ALREADY_EXECUTED)
         (asserts! (not (is-eq (get proposal-type proposal-data) PROPOSAL_TYPE_TREASURY)) ERR_TREASURY_NOT_SET)
         
-        ;; If multisig required, validate signatures
         (if (get requires-multisig proposal-data)
             (asserts! (>= (get-signature-count proposal-id) (var-get required-signatures)) 
                      ERR_INSUFFICIENT_SIGNATURES)
             true)
         
-        ;; Mark as executed
         (map-set proposals { proposal-id: proposal-id }
             (merge proposal-data { executed: true, state: PROPOSAL_EXECUTED }))
         
@@ -547,34 +541,25 @@
     )
 )
 
-;; New function for executing treasury proposals with trait
 (define-public (execute-proposal-with-treasury (proposal-id uint) (treasury <treasury-trait>))
     (let ((proposal-data (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND))
           (current-state (unwrap! (update-proposal-state proposal-id) ERR_PROPOSAL_NOT_FOUND)))
         
-        ;; Validate proposal can be executed
         (asserts! (is-eq current-state PROPOSAL_SUCCEEDED) ERR_PROPOSAL_NOT_ACTIVE)
-        (asserts! (not (get executed proposal-data)) ERR_PROPOSAL_NOT_ACTIVE)
-        
-        ;; Only treasury proposals allowed
+        (asserts! (not (get executed proposal-data)) ERR_PROPOSAL_ALREADY_EXECUTED)
         (asserts! (is-eq (get proposal-type proposal-data) PROPOSAL_TYPE_TREASURY) ERR_INVALID_PROPOSAL)
         
-        ;; If multisig required, validate signatures
         (if (get requires-multisig proposal-data)
             (asserts! (>= (get-signature-count proposal-id) (var-get required-signatures)) 
                      ERR_INSUFFICIENT_SIGNATURES)
             true)
         
-        ;; Execute treasury transfer
         (let ((amount (unwrap! (get treasury-amount proposal-data) ERR_INVALID_AMOUNT))
               (recipient (unwrap! (get treasury-recipient proposal-data) ERR_INVALID_RECIPIENT)))
-            ;; Perform treasury transfer and handle result
             (unwrap! (contract-call? treasury transfer-funds amount recipient none) ERR_TREASURY_EXECUTION_FAILED)
-            ;; Record successful execution
             (map-set treasury-executions { proposal-id: proposal-id }
                 { executed: true, execution-block: stacks-block-height, amount: amount, recipient: recipient }))
         
-        ;; Mark as executed
         (map-set proposals { proposal-id: proposal-id }
             (merge proposal-data { executed: true, state: PROPOSAL_EXECUTED }))
         
@@ -585,16 +570,12 @@
 (define-public (veto-proposal (proposal-id uint))
     (let ((proposal-data (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND)))
         
-        ;; Only contract owner can veto (could be modified for guardian role)
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-        
-        ;; Validate proposal exists and can be vetoed
         (asserts! (> proposal-id u0) ERR_INVALID_PROPOSAL)
         (asserts! (< proposal-id (var-get next-proposal-id)) ERR_PROPOSAL_NOT_FOUND)
         (asserts! (not (is-eq (get state proposal-data) PROPOSAL_EXECUTED)) ERR_PROPOSAL_NOT_ACTIVE)
         (asserts! (not (is-eq (get state proposal-data) PROPOSAL_VETOED)) ERR_PROPOSAL_NOT_ACTIVE)
         
-        ;; Mark as vetoed
         (map-set proposals { proposal-id: proposal-id }
             (merge proposal-data { state: PROPOSAL_VETOED }))
         
@@ -605,17 +586,12 @@
 ;; Guardian management functions
 (define-public (add-guardian (new-guardian principal))
     (begin
-        ;; Only contract owner can add guardians
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-        
-        ;; Validate guardian doesn't already exist
         (asserts! (not (is-guardian new-guardian)) ERR_GUARDIAN_EXISTS)
         
-        ;; Add guardian
         (map-set guardians { guardian: new-guardian }
             { active: true, added-at: stacks-block-height })
         
-        ;; Increment guardian count
         (var-set guardian-count (+ (var-get guardian-count) u1))
         
         (ok true)
@@ -624,19 +600,12 @@
 
 (define-public (remove-guardian (guardian principal))
     (begin
-        ;; Only contract owner can remove guardians
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-        
-        ;; Validate guardian exists
         (asserts! (is-guardian guardian) ERR_GUARDIAN_NOT_FOUND)
-        
-        ;; Ensure minimum guardians remain
         (asserts! (> (var-get guardian-count) (var-get required-signatures)) ERR_MIN_GUARDIANS_REQUIRED)
         
-        ;; Remove guardian
         (map-delete guardians { guardian: guardian })
         
-        ;; Decrement guardian count
         (var-set guardian-count (- (var-get guardian-count) u1))
         
         (ok true)
@@ -646,13 +615,9 @@
 ;; Treasury management functions
 (define-public (set-treasury-contract (treasury principal))
     (begin
-        ;; Only contract owner can set treasury
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-        
-        ;; Validate treasury contract is not zero address
         (asserts! (not (is-eq treasury (as-contract tx-sender))) ERR_INVALID_TREASURY_CONTRACT)
         
-        ;; Set treasury contract
         (var-set treasury-contract (some treasury))
         
         (ok true)
@@ -661,10 +626,8 @@
 
 (define-public (remove-treasury-contract)
     (begin
-        ;; Only contract owner can remove treasury
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
         
-        ;; Remove treasury contract
         (var-set treasury-contract none)
         
         (ok true)
@@ -676,7 +639,7 @@
     (begin
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
         (asserts! (> new-threshold u0) ERR_INVALID_PROPOSAL)
-        (asserts! (<= new-threshold u1000000000000) ERR_INVALID_PROPOSAL) ;; Max reasonable threshold
+        (asserts! (<= new-threshold u1000000000000) ERR_INVALID_PROPOSAL)
         (var-set quorum-threshold new-threshold)
         (ok true)
     )
@@ -685,8 +648,8 @@
 (define-public (set-voting-delay (new-delay uint))
     (begin
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-        (asserts! (>= new-delay u1) ERR_INVALID_PROPOSAL) ;; Min 1 block delay
-        (asserts! (<= new-delay u2016) ERR_INVALID_PROPOSAL) ;; Max 2 weeks
+        (asserts! (>= new-delay u1) ERR_INVALID_PROPOSAL)
+        (asserts! (<= new-delay u2016) ERR_INVALID_PROPOSAL)
         (var-set voting-delay new-delay)
         (ok true)
     )
@@ -695,8 +658,8 @@
 (define-public (set-voting-period (new-period uint))
     (begin
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
-        (asserts! (>= new-period u144) ERR_INVALID_PROPOSAL) ;; Min 1 day
-        (asserts! (<= new-period u4032) ERR_INVALID_PROPOSAL) ;; Max 4 weeks
+        (asserts! (>= new-period u144) ERR_INVALID_PROPOSAL)
+        (asserts! (<= new-period u4032) ERR_INVALID_PROPOSAL)
         (var-set voting-period new-period)
         (ok true)
     )
@@ -706,7 +669,7 @@
     (begin
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
         (asserts! (> new-threshold u0) ERR_INVALID_PROPOSAL)
-        (asserts! (<= new-threshold u1000000000000) ERR_INVALID_PROPOSAL) ;; Max reasonable threshold
+        (asserts! (<= new-threshold u1000000000000) ERR_INVALID_PROPOSAL)
         (var-set proposal-threshold new-threshold)
         (ok true)
     )
