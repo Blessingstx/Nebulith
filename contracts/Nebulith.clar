@@ -27,6 +27,8 @@
 (define-constant ERR_TREASURY_NOT_SET (err u120))
 (define-constant ERR_PROPOSAL_ALREADY_EXECUTED (err u121))
 (define-constant ERR_CANNOT_CANCEL (err u122))
+(define-constant ERR_PROPOSAL_QUEUE_FULL (err u123))
+(define-constant ERR_DUPLICATE_PROPOSAL (err u124))
 
 ;; Data Variables
 (define-data-var next-proposal-id uint u1)
@@ -38,6 +40,8 @@
 (define-data-var required-signatures uint u2) ;; Minimum signatures required
 (define-data-var guardian-count uint u0) ;; Current number of guardians
 (define-data-var treasury-contract (optional principal) none) ;; Treasury contract address
+(define-data-var max-queue-size uint u10) ;; Maximum active proposals per proposer
+(define-data-var active-proposal-count uint u0) ;; Total active proposals
 
 ;; Proposal States
 (define-constant PROPOSAL_PENDING u0)
@@ -94,7 +98,8 @@
         proposal-type: uint,
         treasury-amount: (optional uint),
         treasury-recipient: (optional principal),
-        cancelled-at: (optional uint)
+        cancelled-at: (optional uint),
+        created-at: uint
     }
 )
 
@@ -133,6 +138,17 @@
 (define-map treasury-executions
     { proposal-id: uint }
     { executed: bool, execution-block: uint, amount: uint, recipient: principal }
+)
+
+;; Proposal queue tracking
+(define-map proposer-queue
+    { proposer: principal }
+    { active-count: uint, last-proposal-block: uint }
+)
+
+(define-map proposal-hash-registry
+    { content-hash: (buff 32) }
+    { exists: bool, proposal-id: uint, created-at: uint }
 )
 
 ;; Read-only functions
@@ -251,6 +267,27 @@
     )
 )
 
+(define-read-only (get-proposer-queue (proposer principal))
+    (default-to { active-count: u0, last-proposal-block: u0 }
+        (map-get? proposer-queue { proposer: proposer }))
+)
+
+(define-read-only (get-active-proposal-count)
+    (var-get active-proposal-count)
+)
+
+(define-read-only (can-create-proposal (proposer principal))
+    (let ((queue-data (get-proposer-queue proposer)))
+        (< (get active-count queue-data) (var-get max-queue-size)))
+)
+
+(define-read-only (proposal-hash-exists (content-hash (buff 32)))
+    (match (map-get? proposal-hash-registry { content-hash: content-hash })
+        hash-data (get exists hash-data)
+        false
+    )
+)
+
 ;; Private functions
 (define-private (get-effective-voting-power (voter principal))
     (let ((voter-data (get-voter-power voter)))
@@ -311,6 +348,34 @@
         (ok true))
 )
 
+(define-private (generate-proposal-hash (title (string-ascii 100)) (description (string-ascii 500)))
+    (sha256 (concat (unwrap-panic (as-max-len? (unwrap-panic (to-consensus-buff? title)) u100))
+                    (unwrap-panic (as-max-len? (unwrap-panic (to-consensus-buff? description)) u500))))
+)
+
+(define-private (increment-proposer-queue (proposer principal))
+    (let ((queue-data (get-proposer-queue proposer)))
+        (map-set proposer-queue { proposer: proposer }
+            { active-count: (+ (get active-count queue-data) u1),
+              last-proposal-block: stacks-block-height })
+        (var-set active-proposal-count (+ (var-get active-proposal-count) u1))
+        (ok true))
+)
+
+(define-private (decrement-proposer-queue (proposer principal))
+    (let ((queue-data (get-proposer-queue proposer)))
+        (if (> (get active-count queue-data) u0)
+            (begin
+                (map-set proposer-queue { proposer: proposer }
+                    { active-count: (- (get active-count queue-data) u1),
+                      last-proposal-block: (get last-proposal-block queue-data) })
+                (if (> (var-get active-proposal-count) u0)
+                    (var-set active-proposal-count (- (var-get active-proposal-count) u1))
+                    true)
+                (ok true))
+            (ok true)))
+)
+
 ;; Public functions
 (define-public (create-proposal 
     (title (string-ascii 100))
@@ -319,10 +384,14 @@
           (start-block (+ stacks-block-height (var-get voting-delay)))
           (end-block (+ start-block (var-get voting-period)))
           (proposer-power (get-effective-voting-power tx-sender))
-          (requires-multisig (is-high-value-proposal proposer-power)))
+          (requires-multisig (is-high-value-proposal proposer-power))
+          (content-hash (generate-proposal-hash title description))
+          (queue-data (get-proposer-queue tx-sender)))
         
         (asserts! (>= proposer-power (var-get proposal-threshold)) ERR_INSUFFICIENT_TOKENS)
         (asserts! (validate-proposal-inputs title description) ERR_INVALID_PROPOSAL)
+        (asserts! (< (get active-count queue-data) (var-get max-queue-size)) ERR_PROPOSAL_QUEUE_FULL)
+        (asserts! (not (proposal-hash-exists content-hash)) ERR_DUPLICATE_PROPOSAL)
         
         (map-set proposals { proposal-id: proposal-id }
             {
@@ -340,8 +409,14 @@
                 proposal-type: PROPOSAL_TYPE_GENERAL,
                 treasury-amount: none,
                 treasury-recipient: none,
-                cancelled-at: none
+                cancelled-at: none,
+                created-at: stacks-block-height
             })
+        
+        (map-set proposal-hash-registry { content-hash: content-hash }
+            { exists: true, proposal-id: proposal-id, created-at: stacks-block-height })
+        
+        (unwrap! (increment-proposer-queue tx-sender) ERR_PROPOSAL_QUEUE_FULL)
         
         (if requires-multisig
             (map-set proposal-signature-count { proposal-id: proposal-id } { count: u0 })
@@ -362,12 +437,16 @@
           (start-block (+ stacks-block-height (var-get voting-delay)))
           (end-block (+ start-block (var-get voting-period)))
           (proposer-power (get-effective-voting-power tx-sender))
-          (requires-multisig (or (is-high-value-proposal proposer-power) (>= amount (var-get high-value-threshold)))))
+          (requires-multisig (or (is-high-value-proposal proposer-power) (>= amount (var-get high-value-threshold))))
+          (content-hash (generate-proposal-hash title description))
+          (queue-data (get-proposer-queue tx-sender)))
         
         (asserts! (is-some (var-get treasury-contract)) ERR_TREASURY_NOT_SET)
         (asserts! (>= proposer-power (var-get proposal-threshold)) ERR_INSUFFICIENT_TOKENS)
         (asserts! (validate-proposal-inputs title description) ERR_INVALID_PROPOSAL)
         (asserts! (validate-treasury-params amount recipient) ERR_INVALID_AMOUNT)
+        (asserts! (< (get active-count queue-data) (var-get max-queue-size)) ERR_PROPOSAL_QUEUE_FULL)
+        (asserts! (not (proposal-hash-exists content-hash)) ERR_DUPLICATE_PROPOSAL)
         
         (map-set proposals { proposal-id: proposal-id }
             {
@@ -385,8 +464,14 @@
                 proposal-type: PROPOSAL_TYPE_TREASURY,
                 treasury-amount: (some amount),
                 treasury-recipient: (some recipient),
-                cancelled-at: none
+                cancelled-at: none,
+                created-at: stacks-block-height
             })
+        
+        (map-set proposal-hash-registry { content-hash: content-hash }
+            { exists: true, proposal-id: proposal-id, created-at: stacks-block-height })
+        
+        (unwrap! (increment-proposer-queue tx-sender) ERR_PROPOSAL_QUEUE_FULL)
         
         (if requires-multisig
             (map-set proposal-signature-count { proposal-id: proposal-id } { count: u0 })
@@ -409,6 +494,8 @@
                 state: PROPOSAL_CANCELLED,
                 cancelled-at: (some stacks-block-height)
             }))
+        
+        (unwrap! (decrement-proposer-queue tx-sender) ERR_PROPOSAL_NOT_FOUND)
         
         (ok true)
     )
@@ -537,6 +624,8 @@
         (map-set proposals { proposal-id: proposal-id }
             (merge proposal-data { executed: true, state: PROPOSAL_EXECUTED }))
         
+        (unwrap! (decrement-proposer-queue (get proposer proposal-data)) ERR_PROPOSAL_NOT_FOUND)
+        
         (ok true)
     )
 )
@@ -563,6 +652,8 @@
         (map-set proposals { proposal-id: proposal-id }
             (merge proposal-data { executed: true, state: PROPOSAL_EXECUTED }))
         
+        (unwrap! (decrement-proposer-queue (get proposer proposal-data)) ERR_PROPOSAL_NOT_FOUND)
+        
         (ok true)
     )
 )
@@ -578,6 +669,8 @@
         
         (map-set proposals { proposal-id: proposal-id }
             (merge proposal-data { state: PROPOSAL_VETOED }))
+        
+        (unwrap! (decrement-proposer-queue (get proposer proposal-data)) ERR_PROPOSAL_NOT_FOUND)
         
         (ok true)
     )
@@ -630,6 +723,17 @@
         
         (var-set treasury-contract none)
         
+        (ok true)
+    )
+)
+
+;; Proposal queue management
+(define-public (set-max-queue-size (new-size uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (> new-size u0) ERR_INVALID_PROPOSAL)
+        (asserts! (<= new-size u50) ERR_INVALID_PROPOSAL)
+        (var-set max-queue-size new-size)
         (ok true)
     )
 )
